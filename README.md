@@ -80,6 +80,43 @@ pod 'FeasycomSDK', :path => './FeasycomSDK.podspec'
    `exec: BTRESTREBOOT`, which factory-resets the module. The module reboots
    again, dropping the link — that drop is the expected success signature.
 
+## How the .dfu gets from the phone to the module (code trace)
+
+The app never parses or re-chunks the `.dfu` — it hands the local file to the
+Feasycom SDK, which performs the XMODEM transfer over its own BLE connection.
+The complete phone-side chain:
+
+1. `js/BtModuleUpdateFlow.ts` — after the scan matches the module:
+   `FscSdk.startOta(localPath, foundAddress)` (with a 10 s guard on the
+   native call resolving).
+2. `js/FscSdk.ts` → `FscSdk.startOta(filePath, deviceAddress)` — crosses the
+   React Native bridge to the native module.
+3. **Android** — `android/FscSdkModule.java`, `startOta()`:
+   ```java
+   BluetoothDevice targetDevice = FscCoreSdk.getInstance()
+           .getBluetoothAdapter().getRemoteDevice(deviceAddress);
+   File otaFile = new File(filePath);
+   XmodemBleOta.getInstance().setOtaFile(otaFile);
+   XmodemBleOta.getInstance().startOta(targetDevice, callback);
+   ```
+   From here the transfer runs entirely inside `Fsc_Core_Lib-release.aar`
+   (`XmodemBleOta`), reporting back via `XmodemOtacallback`
+   (`onprogress` = percent, `onsuccess`, `onfailure`).
+4. **iOS** — `ios/FscSdkModule.mm`, `startOta:` + `beginOtaTransfer:`:
+   ```objc
+   NSData *firmwareData = [NSData dataWithContentsOfFile:path];
+   [[FEBluetoothSDK sharedFEBluetoothSDK]
+       connectToOTAWithFactory:NO peripheral:peripheral connectState:...];
+   // on CONNECTSTATE_SUCCESS, on the main queue:
+   FEOTA *ota = [[FEOTA alloc] initWithPeripheral:peripheral];
+   [ota infoFromData:firmwareData complete:...];   // parse the .dfu
+   [ota startProgress:... finish:... abort:... timeout:...];  // XMODEM transfer
+   ```
+   From here the transfer runs entirely inside `libFEBluetoothSDK.a` (`FEOTA`).
+
+The cloud-download step (`js/BtFirmwareDownloader.ts`) exists only to produce
+`localPath`; any local `.dfu` file works the same way.
+
 ## Platform notes / known behaviors
 
 - **Progress unit**: both platforms emit progress as a percentage (0→~100).
